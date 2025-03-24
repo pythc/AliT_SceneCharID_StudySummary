@@ -1,0 +1,337 @@
+import os
+import json
+import paddle
+import numpy as np
+from paddle.io import Dataset
+from paddle.vision import transforms
+from paddle.vision.models import resnet50
+import random
+
+# ------------------------- 配置 -------------------------
+class Config:
+    # 数据集路径更新为 train_part，其中包含 game_1 到 game_5 文件夹
+    data_root = r"D:\PythonProject\paddle\train_part"
+    input_size = (640, 640)
+    batch_size = 4
+    num_workers = 0
+    lr = 0.0001            # 降低学习率以提高稳定性
+    epochs = 50
+    patience = 5           # 验证 loss 无改善的耐心
+    pretrained_path = r"D:\PythonProject\paddle\resnet50.pdparams"
+    train_split = 0.8      # 80% 训练，20% 验证
+
+# ------------------------- Dataset -------------------------
+class PingpongDataset(Dataset):
+    def __init__(self, mode='train'):
+        self.mode = mode
+        self.data_root = Config.data_root
+        all_annotations = self._load_annotations()
+        # 按文件名排序后划分（按 train_split 划分训练集和验证集）
+        all_keys = sorted(list(all_annotations.keys()))
+        split_index = int(len(all_keys) * Config.train_split)
+        if self.mode == 'train':
+            selected_keys = all_keys[:split_index]
+        else:
+            selected_keys = all_keys[split_index:]
+        self.annotations = {k: all_annotations[k] for k in selected_keys}
+        self.transforms = self._build_transforms()
+
+    def _load_annotations(self):
+        anns = {}
+        # 遍历 data_root 下所有 game 文件夹
+        for game in os.listdir(self.data_root):
+            game_path = os.path.join(self.data_root, game)
+            if not os.path.isdir(game_path):
+                continue
+            ann_file = os.path.join(game_path, 'annotations.json')
+            if not os.path.exists(ann_file):
+                continue
+            with open(ann_file, 'r') as f:
+                game_anns = json.load(f)
+            # 遍历当前 game 文件夹下的所有标注
+            for frame_id, info in game_anns.items():
+                # 如果 "ball_position" 键不存在，则跳过该样本
+                if "ball_position" not in info:
+                    continue
+                frame_id_padded = str(frame_id).zfill(6)
+                img_path = os.path.join(game_path, 'frames', f'frame_{frame_id_padded}.png')
+                if os.path.exists(img_path):
+                    anns[img_path] = {
+                        'center': [info['ball_position']['x'], info['ball_position']['y']],
+                        'event': 1 if info['event'] == 'bounce' else 0
+                    }
+        return anns
+
+    def _build_transforms(self):
+        if self.mode == 'train':
+            return transforms.Compose([
+                transforms.RandomResizedCrop(Config.input_size, scale=(0.6, 1.0)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ColorJitter(0.3, 0.3),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+        else:
+            return transforms.Compose([
+                transforms.Resize(Config.input_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+            ])
+
+    def __getitem__(self, idx):
+        img_path = list(self.annotations.keys())[idx]
+        ann = self.annotations[img_path]
+        img = paddle.vision.image_load(img_path).convert('RGB')
+        img = self.transforms(img)
+        h, w = Config.input_size  # 640,640
+        cx, cy = ann['center']
+        # 将原始像素坐标映射到输入尺寸，再归一化到 [0,1]
+        bbox = [
+            max(0, (cx - 8) / 1920 * w) / w,
+            max(0, (cy - 8) / 1080 * h) / h,
+            min(w, (cx + 8) / 1920 * w) / w,
+            min(h, (cy + 8) / 1080 * h) / h
+        ]
+        bbox = paddle.to_tensor(bbox, dtype='float32')
+        event = paddle.to_tensor([ann['event']], dtype='int64')
+        return img, bbox, event
+
+    def __len__(self):
+        return len(self.annotations)
+
+# ------------------------- Backbone + Neck -------------------------
+class ResNetBackbone(paddle.nn.Layer):
+    def __init__(self):
+        super().__init__()
+        resnet = resnet50()
+        resnet.set_state_dict(paddle.load(Config.pretrained_path))
+        self.stem = paddle.nn.Sequential(
+            resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool
+        )
+        self.layer1 = resnet.layer1  # C2
+        self.layer2 = resnet.layer2  # C3
+        self.layer3 = resnet.layer3  # C4
+        self.layer4 = resnet.layer4  # C5
+
+    def forward(self, x):
+        x = self.stem(x)
+        c2 = self.layer1(x)
+        c3 = self.layer2(c2)
+        c4 = self.layer3(c3)
+        c5 = self.layer4(c4)
+        return [c3, c4, c5]
+
+class FPNNeck(paddle.nn.Layer):
+    def __init__(self):
+        super().__init__()
+        self.lateral3 = paddle.nn.Conv2D(512, 256, 1)
+        self.lateral4 = paddle.nn.Conv2D(1024, 256, 1)
+        self.lateral5 = paddle.nn.Conv2D(2048, 256, 1)
+        self.output3 = paddle.nn.Conv2D(256, 256, 3, padding=1)
+        self.output4 = paddle.nn.Conv2D(256, 256, 3, padding=1)
+        self.output5 = paddle.nn.Conv2D(256, 256, 3, padding=1)
+
+    def forward(self, features):
+        c3, c4, c5 = features
+        p5 = self.lateral5(c5)
+        p4 = self.lateral4(c4) + paddle.nn.functional.interpolate(p5, scale_factor=2, mode='nearest')
+        p3 = self.lateral3(c3) + paddle.nn.functional.interpolate(p4, scale_factor=2, mode='nearest')
+        out3 = self.output3(p3)
+        out4 = self.output4(p4)
+        out5 = self.output5(p5)
+        return [out3, out4, out5]
+
+# ------------------------- Detection Head -------------------------
+class DetectionHead(paddle.nn.Layer):
+    def __init__(self):
+        super().__init__()
+        # 使用两层卷积，加 ReLU 后，最后用 Sigmoid 保证输出在 [0,1]
+        self.conv = paddle.nn.Sequential(
+            paddle.nn.Conv2D(256, 256, 3, padding=1),
+            paddle.nn.ReLU(),
+            paddle.nn.Conv2D(256, 4, 1),
+            paddle.nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.conv(x)  # [N, 4, H, W]
+
+# ------------------------- Event Classifier (带 SE) -------------------------
+class SEBlock(paddle.nn.Layer):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.pool = paddle.nn.AdaptiveAvgPool2D(1)
+        self.fc = paddle.nn.Sequential(
+            paddle.nn.Linear(channels, channels // reduction),
+            paddle.nn.ReLU(),
+            paddle.nn.Linear(channels // reduction, channels),
+            paddle.nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        y = self.pool(x).reshape([b, c])
+        y = self.fc(y).reshape([b, c, 1, 1])
+        return x * y
+
+class EventClassifier(paddle.nn.Layer):
+    def __init__(self):
+        super().__init__()
+        self.se = SEBlock(256)
+        self.pool = paddle.nn.AdaptiveAvgPool2D(1)
+        self.fc = paddle.nn.Sequential(
+            paddle.nn.Flatten(),
+            paddle.nn.Dropout(0.5),
+            paddle.nn.Linear(256, 2)
+        )
+
+    def forward(self, x):
+        x = self.se(x)
+        x = self.pool(x)
+        return self.fc(x)
+
+# ------------------------- 多任务模型 -------------------------
+class PingpongModel(paddle.nn.Layer):
+    def __init__(self):
+        super().__init__()
+        self.backbone = ResNetBackbone()
+        self.neck = FPNNeck()
+        self.det_head = DetectionHead()
+        self.event_cls = EventClassifier()
+
+    def forward(self, x):
+        feats = self.backbone(x)
+        fpn_feats = self.neck(feats)
+        # 检测分支：使用 P3 分支（较高分辨率）
+        det_out = self.det_head(fpn_feats[0])   # [N, 4, H, W]
+        # 事件分类分支：同样使用 P3 分支
+        event_out = self.event_cls(fpn_feats[0])  # [N, 2]
+        return det_out, event_out
+
+# ------------------------- 改进版 GIoU Loss -------------------------
+class GIoULoss(paddle.nn.Layer):
+    def forward(self, pred_boxes, target_boxes):
+        # pred_boxes, target_boxes: [N,4] 坐标均归一化到 [0,1]
+        x1, y1, x2, y2 = pred_boxes[:, 0], pred_boxes[:, 1], pred_boxes[:, 2], pred_boxes[:, 3]
+        x1g, y1g, x2g, y2g = target_boxes[:, 0], target_boxes[:, 1], target_boxes[:, 2], target_boxes[:, 3]
+
+        inter_x1 = paddle.maximum(x1, x1g)
+        inter_y1 = paddle.maximum(y1, y1g)
+        inter_x2 = paddle.minimum(x2, x2g)
+        inter_y2 = paddle.minimum(y2, y2g)
+        inter_area = paddle.clip(inter_x2 - inter_x1, min=0) * paddle.clip(inter_y2 - inter_y1, min=0)
+
+        area_pred = (x2 - x1) * (y2 - y1)
+        area_gt = (x2g - x1g) * (y2g - y1g)
+        union_area = area_pred + area_gt - inter_area
+        iou = inter_area / (union_area + 1e-8)
+
+        enclose_x1 = paddle.minimum(x1, x1g)
+        enclose_y1 = paddle.minimum(y1, y1g)
+        enclose_x2 = paddle.maximum(x2, x2g)
+        enclose_y2 = paddle.maximum(y2, y2g)
+        enclose_area = (enclose_x2 - enclose_x1) * (enclose_y2 - enclose_y1) + 1e-8
+
+        giou = iou - (enclose_area - union_area) / enclose_area
+        giou = paddle.clip(giou, min=-1.0, max=1.0)
+        return paddle.mean(1 - giou)
+
+# ------------------------- MultiTask Loss -------------------------
+class MultiTaskLoss(paddle.nn.Layer):
+    def __init__(self):
+        super().__init__()
+        self.det_loss = GIoULoss()
+        self.cls_loss = paddle.nn.CrossEntropyLoss()
+
+    def forward(self, det_pred_map, cls_pred, bbox_target, event_target):
+        # det_pred_map: [N, 4, H, W]，取中心点预测作为 bbox 输出
+        N, _, H, W = det_pred_map.shape
+        center_x = H // 2
+        center_y = W // 2
+        det_pred = det_pred_map[:, :, center_x, center_y]  # [N, 4]
+        det_pred = paddle.clip(det_pred, 0.0, 1.0)  # 确保预测 bbox 在 [0,1]
+        det_loss = self.det_loss(det_pred, bbox_target)
+        cls_loss = self.cls_loss(cls_pred, event_target.squeeze(-1))
+        return 0.5 * det_loss + 1.0 * cls_loss
+
+# ------------------------- 训练和验证 -------------------------
+def validate_loss(model, criterion, val_loader):
+    model.eval()
+    total_loss = 0.0
+    count = 0
+    with paddle.no_grad():
+        for images, bboxes, events in val_loader:
+            det_outputs, cls_outputs = model(images)
+            loss = criterion(det_outputs, cls_outputs, bboxes, events)
+            total_loss += loss.numpy().item() * images.shape[0]
+            count += images.shape[0]
+    return total_loss / count
+
+def validate(model):
+    val_dataset = PingpongDataset('val')
+    val_loader = paddle.io.DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False)
+    model.eval()
+    correct = 0
+    total = 0
+    with paddle.no_grad():
+        for images, bboxes, events in val_loader:
+            _, cls_outputs = model(images)
+            preds = paddle.argmax(cls_outputs, axis=1)
+            correct += (preds == events.squeeze(-1)).sum().item()
+            total += events.shape[0]
+    acc = 100 * correct / total
+    print(f"Validation Accuracy: {acc:.2f}%")
+    return acc
+
+def train():
+    # 划分验证集：PingpongDataset 内部根据所有 game 文件夹中的样本划分（按 train_split）
+    train_dataset = PingpongDataset('train')
+    train_loader = paddle.io.DataLoader(train_dataset, batch_size=Config.batch_size, shuffle=True)
+    model = PingpongModel()
+    optimizer = paddle.optimizer.AdamW(
+        parameters=model.parameters(),
+        learning_rate=Config.lr,
+        grad_clip=paddle.nn.ClipGradByNorm(clip_norm=5.0)
+    )
+    lr_scheduler = paddle.optimizer.lr.CosineAnnealingDecay(Config.lr, T_max=Config.epochs)
+    criterion = MultiTaskLoss()
+
+    best_val_loss = float('inf')
+    best_state = None
+    patience_counter = 0
+
+    for epoch in range(Config.epochs):
+        model.train()
+        for batch_idx, (images, bboxes, events) in enumerate(train_loader):
+            det_outputs, cls_outputs = model(images)
+            loss = criterion(det_outputs, cls_outputs, bboxes, events)
+            loss.backward()
+            optimizer.step()
+            optimizer.clear_grad()
+            if batch_idx % 10 == 0:
+                print(f"Epoch {epoch} Batch {batch_idx} Loss: {loss.numpy().item():.4f}")
+        lr_scheduler.step()
+        # 构造验证集
+        val_dataset = PingpongDataset('val')
+        val_loader = paddle.io.DataLoader(val_dataset, batch_size=Config.batch_size, shuffle=False)
+        val_loss = validate_loss(model, criterion, val_loader)
+        print(f"Epoch {epoch} Validation Loss: {val_loss:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = model.state_dict()
+            patience_counter = 0
+            print("New best model found!")
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs. Rolling back to best model.")
+            if best_state is not None:
+                model.set_state_dict(best_state)
+            if patience_counter >= Config.patience:
+                print("Early stopping triggered!")
+                break
+        validate(model)
+
+if __name__ == "__main__":
+    train()

@@ -53,14 +53,4 @@ This project is licensed under the [Apache License 2.0](LICENSE).
 
 
 ## Contact  
-For issues or collaboration inquiries, please open an [Issue](https://github.com/your-username/your-repo/issues) or email: `2813994715@qq.com`.  
-
-
-
-
-
-
-
-
-
-This project leverages PaddlePaddle's deep learning capabilities and the PP-YOLOE-SOD model for small object detection to achieve accurate recognition of table tennis balls and bounce events, providing a technical solution for intelligent sports analysis.
+For issues or collaboration inquiries, please open an [Issue]([https://github.com/pythc/Table-Tennis-Recognition-Basedon-PP-YOLOE-SOD/issues]) or email: `2813994715@qq.com`.  
